@@ -1,0 +1,94 @@
+name: Publish images and deploy (optional)
+
+# Does nothing unless you opt in. See MANUAL_SETUP_STEPS.md.
+#   Repository variable  PUBLISH_IMAGES=true  -> push images to GitHub Container Registry (uses the built-in GITHUB_TOKEN)
+#   Repository variable  DEPLOY_ENABLED=true  -> after publishing, deploy over SSH using the secrets listed below
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish images to GHCR
+    if: ${{ vars.PUBLISH_IMAGES == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      image_prefix: ${{ steps.meta.outputs.prefix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute image names and tag
+        id: meta
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "prefix=ghcr.io/${owner}/missionsprint" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"; else echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"; fi
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.prefix }}-backend:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.prefix }}-backend:latest
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          build-args: VITE_API_BASE_URL=/api
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.prefix }}-frontend:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.prefix }}-frontend:latest
+
+  deploy:
+    name: Deploy over SSH
+    needs: publish
+    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    environment: production   # add required reviewers on this environment for manual approval
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      DEPLOY_HEALTHCHECK_URL: ${{ vars.DEPLOY_HEALTHCHECK_URL }}
+      GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+    steps:
+      - name: Check deployment configuration
+        run: |
+          missing=""
+          for v in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS DEPLOY_PATH DEPLOY_HEALTHCHECK_URL; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then echo "Missing required secrets/variables:$missing" >&2; exit 1; fi
+      - name: Deploy
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd '$DEPLOY_PATH' && export BACKEND_IMAGE='${{ needs.publish.outputs.image_prefix }}-backend' FRONTEND_IMAGE='${{ needs.publish.outputs.image_prefix }}-frontend' IMAGE_TAG='${{ needs.publish.outputs.tag }}' && \
+             if [ -n '${GHCR_PULL_TOKEN:-}' ]; then echo '${GHCR_PULL_TOKEN:-}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin; fi && \
+             docker compose pull backend frontend && docker compose up -d --no-build"
+      - name: Verify the deployed application answers
+        run: |
+          for i in $(seq 1 18); do
+            if curl -fsS "$DEPLOY_HEALTHCHECK_URL" | grep -q '"database":"connected"'; then echo "Deployment verified: $DEPLOY_HEALTHCHECK_URL reports a connected database"; exit 0; fi
+            sleep 10
+          done
+          echo "Deployment health check failed for $DEPLOY_HEALTHCHECK_URL" >&2; exit 1
